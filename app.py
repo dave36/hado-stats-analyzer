@@ -86,10 +86,6 @@ with tab_upload:
     if can_process:
         if st.button("Process logs"):
             with st.spinner("Processing..."):
-                tmp = tempfile.mkdtemp()
-                socket_path = os.path.join(tmp, "socket.log")
-                stats_path = os.path.join(tmp, "stats.log")
-
                 if zip_file:
                     try:
                         with zipfile.ZipFile(zip_file) as z:
@@ -101,22 +97,21 @@ with tab_upload:
                                 )
                                 st.stop()
 
-                            with z.open(socket_member) as source, open(socket_path, "wb") as target:
-                                target.write(source.read())
-                            with z.open(stats_member) as source, open(stats_path, "wb") as target:
-                                target.write(source.read())
+                            socket_file_like = z.open(socket_member)
+                            stats_file_like = z.open(stats_member)
                     except zipfile.BadZipFile:
                         st.error("The ZIP file is invalid or corrupted.")
                         st.stop()
                 else:
-                    with open(socket_path, "wb") as f:
-                        f.write(socket_file.read())
-                    with open(stats_path, "wb") as f:
-                        f.write(stats_file.read())
+                    import io
+                    socket_content = socket_file.getvalue().decode('utf-8')
+                    stats_content = stats_file.getvalue().decode('utf-8')
+                    socket_file_like = io.StringIO(socket_content)
+                    stats_file_like = io.StringIO(stats_content)
 
                 df = parse_logs_and_build_dataframe(
-                    socket_path,
-                    stats_path
+                    socket_file_like,
+                    stats_file_like
                 )
 
                 st.session_state["df"] = df
