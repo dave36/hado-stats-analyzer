@@ -5,8 +5,39 @@ import pandas as pd
 import plotly.express as px
 import tempfile
 import os
+import zipfile
 
 from main import parse_logs_and_build_dataframe
+
+# Helper for ZIP uploads
+
+def locate_log_files_in_zip(zip_file):
+    log_members = [m for m in zip_file.namelist() if m.lower().endswith(".log")]
+    if len(log_members) != 2:
+        return None, None
+
+    socket_member = None
+    stats_member = None
+
+    for member in log_members:
+        try:
+            with zip_file.open(member) as source:
+                for line in source:
+                    if b"ON DeviceInfo:" in line:
+                        socket_member = member
+                        break
+                    if b"EMIT PlayerLog:" in line:
+                        stats_member = member
+                        break
+        except Exception:
+            continue
+
+    if socket_member and stats_member:
+        return socket_member, stats_member
+
+    # Fallback: if exactly two .log files, use them in order
+    return log_members[0], log_members[1]
+
 
 # Function to color MVP rows
 def highlight_mvp(row):
@@ -33,25 +64,55 @@ with tab_upload:
 
     st.header("⬆️ Upload log files")
 
-    socket_file = st.file_uploader("socket-event.log", type=["log", "txt"])
-    stats_file = st.file_uploader("stats.log", type=["log", "txt"])
+    zip_file = st.file_uploader(
+        "Upload a ZIP containing both socket-event.log and stats.log",
+        type=["zip"]
+    )
 
-    if socket_file and stats_file:
+    if zip_file is None:
+        socket_file = st.file_uploader("socket-event.log", type=["log", "txt"])
+        stats_file = st.file_uploader("stats.log", type=["log", "txt"])
+    else:
+        socket_file = None
+        stats_file = None
+        st.info("ZIP uploaded: individual log upload is disabled.")
 
+    can_process = False
+    if zip_file:
+        can_process = True
+    elif socket_file and stats_file:
+        can_process = True
+
+    if can_process:
         if st.button("Process logs"):
-
             with st.spinner("Processing..."):
-
                 tmp = tempfile.mkdtemp()
-
                 socket_path = os.path.join(tmp, "socket.log")
                 stats_path = os.path.join(tmp, "stats.log")
 
-                with open(socket_path, "wb") as f:
-                    f.write(socket_file.read())
+                if zip_file:
+                    try:
+                        with zipfile.ZipFile(zip_file) as z:
+                            socket_member, stats_member = locate_log_files_in_zip(z)
 
-                with open(stats_path, "wb") as f:
-                    f.write(stats_file.read())
+                            if not socket_member or not stats_member:
+                                st.error(
+                                    "The ZIP must contain exactly two .log files: one socket-event log and one stats log."
+                                )
+                                st.stop()
+
+                            with z.open(socket_member) as source, open(socket_path, "wb") as target:
+                                target.write(source.read())
+                            with z.open(stats_member) as source, open(stats_path, "wb") as target:
+                                target.write(source.read())
+                    except zipfile.BadZipFile:
+                        st.error("The ZIP file is invalid or corrupted.")
+                        st.stop()
+                else:
+                    with open(socket_path, "wb") as f:
+                        f.write(socket_file.read())
+                    with open(stats_path, "wb") as f:
+                        f.write(stats_file.read())
 
                 df = parse_logs_and_build_dataframe(
                     socket_path,
@@ -59,7 +120,6 @@ with tab_upload:
                 )
 
                 st.session_state["df"] = df
-
                 st.success("Logs processed successfully")
 
 # ==================================================
@@ -97,6 +157,20 @@ def detect_role(row):
 
 
 df["Role"] = df.apply(lambda r: detect_role(r), axis=1)
+
+# --------------------------------------------------
+# WINNER TEAM
+# --------------------------------------------------
+
+def get_winner(row):
+    if row["ScoreTeamRed"] > row["ScoreTeamBlue"]:
+        return "Red"
+    if row["ScoreTeamBlue"] > row["ScoreTeamRed"]:
+        return "Blue"
+    return "Draw"
+
+
+df["WinnerTeam"] = df.apply(get_winner, axis=1)
 
 # ==================================================
 # TAB PARTIDO
@@ -392,6 +466,35 @@ with tab_global:
         "ChargeMillisecond"
     ]
 
+    player_matches = (
+        global_df[
+            ["PlayerId", "Role", "MatchId", "Team", "WinnerTeam"]
+        ]
+        .drop_duplicates()
+    )
+
+    player_matches["Win"] = (
+        player_matches["Team"] == player_matches["WinnerTeam"]
+    )
+
+    winrate_df = (
+        player_matches
+        .groupby(["PlayerId", "Role"])
+        .agg(
+            Partidas_jugadas=("MatchId", "count"),
+            Partidas_ganadas=("Win", "sum")
+        )
+        .reset_index()
+    )
+
+    winrate_df["Winrate (%)"] = (
+        winrate_df["Partidas_ganadas"]
+        / winrate_df["Partidas_jugadas"]
+        * 100
+    ).round(2)
+
+    winrate_df = winrate_df[["PlayerId", "Role", "Winrate (%)"]]
+
     means_df = (
         global_df
         .groupby(["PlayerId", "Role"])[numeric_cols]
@@ -400,6 +503,12 @@ with tab_global:
         .reset_index()
         .rename(columns={"BrokenPlayer": "Kills"})
         .rename(columns={"Out": "Deaths"})
+    )
+
+    means_df = means_df.merge(
+        winrate_df,
+        on=["PlayerId", "Role"],
+        how="left"
     )
 
     st.dataframe(means_df, use_container_width=True)
